@@ -45,7 +45,7 @@ _fake() { # <name>
 }
 mechanism_destination()        { _fake destination; }
 mechanism_repository()         { _fake repository; }
-mechanism_publish()            { printf "%s" "${1:-}" > "$FAKE_DIR/publish.open"; _fake publish; }
+mechanism_publish()            { printf "%s" "${1:-}" > "$FAKE_DIR/publish.open"; printf "%s" "${2:-}" > "$FAKE_DIR/publish.issue"; _fake publish; }
 mechanism_push()               { _fake push; }
 mechanism_change_view()        { _fake view; }
 mechanism_integration_mode()   { _fake mode; }
@@ -60,6 +60,7 @@ mechanism_republish()          { touch "$FAKE_DIR/republish.called"; _fake repub
 mechanism_integrate()          { _fake integrate; }
 mechanism_cleanup()            { printf '%s' "${1:-}" > "$FAKE_DIR/cleanup.branch"; _fake cleanup; }
 mechanism_open_issue()       { printf '%s' "${1:-}" > "$FAKE_DIR/issue.title"; cp "${2:-}" "$FAKE_DIR/issue.body" 2>/dev/null || true; _fake issue; }
+mechanism_close_issue()      { printf '%s' "${1:-}" > "$FAKE_DIR/closed.issue"; _fake close; }
 mechanism_verification_snapshot() { _fake ci; }
 mechanism_verification_wait()     { printf '%s' "${1:-}" > "$FAKE_DIR/ci.wait"; _fake ci; }
 mechanism_review_state()          { _fake review_state; }
@@ -539,6 +540,33 @@ fake_err publish '{"error":"PUBLISH_FAILED"}'
 run_fake propose-change
 check "publish failed reason" "PUBLISH_FAILED" "$(jout '.reason')"
 
+# The tracked item the change closes reaches the mechanism, and an unlinked
+# change sends nothing: the link is opt-in at publication, never invented.
+fake_clear
+fake_ok destination '{"repository":"deadbeef","integration_base":"dev"}'
+fake_ok publish '{"change":"7","state":"proposed","open_for_integration":false}'
+run_fake propose-change --issue 42
+check "publish issue forwarded" "42" "$(cat "$FAKE_DIR/publish.issue")"
+run_fake propose-change
+check "publish unlinked sends nothing" "" "$(cat "$FAKE_DIR/publish.issue")"
+
+# The marker the publishing verb wrote into the planning issue file is read
+# here, so a run that already opened its item never has to repeat the number.
+oi_pub="$tmp/oi-pub.md"
+printf '# Something\n\nForge-Issue: 53 https://example.invalid/o/r/issues/53\n' > "$oi_pub"
+run_fake propose-change --issue-file "$oi_pub"
+check "publish issue from marker" "53" "$(cat "$FAKE_DIR/publish.issue")"
+
+printf '# Something\n' > "$oi_pub"
+run_fake propose-change --issue-file "$oi_pub"
+check "publish markerless file sends nothing" "" "$(cat "$FAKE_DIR/publish.issue")"
+
+run_fake propose-change --issue-file "$tmp/absent-issue.md"
+check "publish issue file missing reason" "issue_file_unreadable" "$(jout '.reason')"
+
+run_fake propose-change --issue 'not-a-number'
+check "publish bad issue reason" "invalid_issue_number" "$(jout '.reason')"
+
 # A change nothing will ever verify says so AT PUBLICATION — the moment acting
 # on it is still cheap — and only when the repository declares no local policy:
 # a warning that fires for every repo would be a warning nobody reads.
@@ -992,6 +1020,19 @@ check "apply real no-op content" "$tree_before" "$(git -C "$repo" rev-parse 'HEA
 echo "=== H. integrate-change ==="
 integrate_view_ok='{"change":"9","state":"proposed","open_for_integration":true,"integratable":true,"requested_changes":false,"endorsements":1,"verification":{"state":"passing","detail":""}}'
 
+# The full happy-path mechanism set, so the close tests below express only what
+# they are about: which item is closed, and whether closing changes the result.
+integrate_stack_ok() {
+  fake_ok destination '{"repository":"deadbeef","integration_base":"dev"}'
+  fake_ok mode '{"mode":"linear"}'
+  fake_ok collapses '{"collapses":false}'
+  fake_ok compatibility '{"compatibility":"ready"}'
+  fake_ok history '{"head":"H","base":"B","unsaved":false,"protected":false,"steps":[]}'
+  fake_ok republish '{"change":"9","state":"proposed","open_for_integration":true}'
+  fake_ok view "$integrate_view_ok"
+  fake_ok integrate '{"state":"integrated","noop":false}'
+}
+
 fake_clear
 fake_ok destination '{"repository":"deadbeef","integration_base":"dev"}'
 fake_ok mode '{"mode":"merge"}'
@@ -1103,6 +1144,45 @@ has_single_json_line "integrate"
 check "integrate ok" true "$(jout '.ok')"
 check "integrate integrated" true "$(jout '.integrated')"
 check "integrate change not null" "9" "$(jout '.change')"
+
+# The tracked item is closed AFTER a real integration, read from the marker the
+# opening verb wrote: the run never has to repeat the number.
+ci_pub="$tmp/close-issue.md"
+printf '# Something\n\nForge-Issue: 77 https://example.invalid/o/r/issues/77\n' > "$ci_pub"
+fake_clear
+integrate_stack_ok
+fake_ok close '{"ok":true,"forge":"github","number":77}'
+run_fake integrate-change --issue-file "$ci_pub"
+check "integrate closes tracked item" "77" "$(cat "$FAKE_DIR/closed.issue")"
+check "integrate close ok" true "$(jout '.ok')"
+check "integrate close silent" 0 "$(jout '.warnings|length')"
+
+# Re-entry after a completed integration still closes: a run that integrated and
+# then died before closing must end consistent, and closing twice is a no-op.
+fake_ok view '{"change":"9","state":"integrated","open_for_integration":true,"integratable":true,"requested_changes":false,"endorsements":1,"verification":{"state":"passing","detail":""}}'
+rm -f "$FAKE_DIR/closed.issue"
+run_fake integrate-change --issue 77
+check "integrate reentry closes item" "77" "$(cat "$FAKE_DIR/closed.issue")"
+check "integrate reentry noop" true "$(jout '.noop')"
+
+# A tracker that refuses is a warning, never a failed integration: the change is
+# integrated either way, and retrying the integrate would change nothing.
+fake_clear
+integrate_stack_ok
+fake_err close '{"error":"ISSUE_CLOSE_FAILED"}'
+run_fake integrate-change --issue 77
+check "integrate close failure still ok" true "$(jout '.ok')"
+check "integrate close failure integrated" true "$(jout '.integrated')"
+check "integrate close failure warning" "issue_not_closed" "$(jout '.warnings[0]')"
+
+# A run that never opened an item closes nothing: there is no marker and no
+# number, and that is not a gap.
+fake_clear
+integrate_stack_ok
+run_fake integrate-change
+check "integrate unlinked closes nothing" "absent" \
+  "$([[ -e $FAKE_DIR/closed.issue ]] && printf 'called' || printf 'absent')"
+
 
 # The `local` policy at the integrate gate: the suite runs HERE, against the
 # tree about to be integrated — a proof, not a waiver — and every non-green

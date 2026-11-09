@@ -130,5 +130,98 @@ out=$(run_push "$WORK/work" publish-change --open)
 check "single json line" 1 "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
 check "has warnings"     true "$(printf '%s' "$out" | jq -r 'has("warnings")')"
 
+echo "=== H. the tracked item reaches the published body ==="
+# The link back to a tracked item lives in the published body, because that is
+# the only place the tracker reads a closing reference. The stub records the argv
+# it was given, so this asserts on what the mechanism actually asked for.
+GH_LOG="$WORK/gh.log"
+: > "$GH_LOG"
+mk_gh_stub() {
+  mkdir -p "$WORK/bin"
+  cat > "$WORK/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$1 $2" in
+  "pr view")
+    case "$*" in
+      *"--json number,state,isDraft,mergeable,reviewDecision,reviews,statusCheckRollup"*)
+        printf '%s\n' '{"number":7,"state":"OPEN","isDraft":true,"mergeable":"MERGEABLE","reviewDecision":"","reviews":[],"statusCheckRollup":[]}'
+        exit 0 ;;
+      *)
+        # An already-proposed change: the suite flips this file to exercise the
+        # refresh path instead of the create path.
+        [[ -n ${GH_EXISTS_MARK:-} && -f $GH_EXISTS_MARK ]] && exit 0
+        exit 1 ;;
+    esac ;;
+  "pr create") printf '%s\n' 'https://github.com/example/repo/pull/7'; exit 0 ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod +x "$WORK/bin/gh"
+}
+mk_gh_stub
+export PATH="$WORK/bin:$PATH"
+export GH_LOG
+export GH_EXISTS_MARK="$WORK/pr-exists"
+
+P2="$WORK/propose-issue"
+git init -q -b main "$P2"
+git -C "$P2" "${GITC[@]}" commit -q --allow-empty -m init
+git -C "$P2" checkout -q -b feat/demo
+git -C "$P2" "${GITC[@]}" commit -q --allow-empty -m work
+git -C "$P2" remote add origin https://github.com/example/repo.git
+
+: > "$GH_LOG"
+out=$(run_propose "$P2" propose-change --issue 42)
+check "issue link published"  true          "$(printf '%s' "$out" | jq -r '.ok')"
+check "issue link change"     "7"           "$(printf '%s' "$out" | jq -r '.change')"
+check "issue link in body"    1             "$(grep -c 'Closes #42' "$GH_LOG")"
+check "issue link title is the branch" "feat/demo" \
+  "$(grep 'pr create' "$GH_LOG" | sed -E 's/.*--title ([^ ]+).*/\1/')"
+
+# Without an item the body stays empty: no dangling keyword, no invented link.
+: > "$GH_LOG"
+out=$(run_propose "$P2" propose-change)
+check "no issue no link"     0             "$(grep -c 'Closes #' "$GH_LOG")"
+check "no issue still ok"    true          "$(printf '%s' "$out" | jq -r '.ok')"
+
+# The marker is the second source, so a resumed run never repeats the number.
+MARK="$WORK/issue.md"
+printf '# Something\n\nForge-Issue: 53 https://example.invalid/o/r/issues/53\n' > "$MARK"
+: > "$GH_LOG"
+out=$(run_propose "$P2" propose-change --issue-file "$MARK")
+check "marker link published" 1            "$(grep -c 'Closes #53' "$GH_LOG")"
+check "marker link ok"       true          "$(printf '%s' "$out" | jq -r '.ok')"
+
+# Input the caller can still fix is refused before anything leaves the machine.
+out=$(run_propose "$P2" propose-change --issue not-a-number)
+check "bad issue reason"     "invalid_issue_number" "$(printf '%s' "$out" | jq -r '.reason')"
+check "bad issue value echoed" "not-a-number" "$(printf '%s' "$out" | jq -r '.issue')"
+out=$(run_propose "$P2" propose-change --issue-file "$WORK/absent.md")
+check "absent issue file reason" "issue_file_unreadable" "$(printf '%s' "$out" | jq -r '.reason')"
+
+# A marker whose number is missing is malformed, not an unlinked run: silently
+# unlinking would hide a broken artifact.
+BADMARK="$WORK/issue-bad.md"
+printf '# Something\n\nForge-Issue:\n' > "$BADMARK"
+out=$(run_propose "$P2" propose-change --issue-file "$BADMARK")
+check "marker without number reason" "invalid_issue_number" "$(printf '%s' "$out" | jq -r '.reason')"
+
+# An already-proposed change with no item to link must still succeed: the body
+# refresh is skipped, not a failing statement that aborts the run.
+touch "$GH_EXISTS_MARK"
+: > "$GH_LOG"
+out=$(run_propose "$P2" propose-change)
+check "existing proposal no item ok" true "$(printf '%s' "$out" | jq -r '.ok')"
+check "existing proposal no item no link" 0 "$(grep -c 'Closes #' "$GH_LOG")"
+
+# ...and with an item, the refresh carries the link instead of opening a second
+# proposal.
+: > "$GH_LOG"
+out=$(run_propose "$P2" propose-change --issue 42)
+check "existing proposal links" 1 "$(grep -c 'Closes #42' "$GH_LOG")"
+check "existing proposal no second create" 0 "$(grep -c 'pr create' "$GH_LOG")"
+rm -f "$GH_EXISTS_MARK"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [[ $fail -eq 0 ]]

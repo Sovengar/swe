@@ -211,11 +211,11 @@ mechanism_push() {
      verification_state: "unknown"}'
 }
 
-mechanism_publish() { # <open:true|false>
+mechanism_publish() { # <open:true|false> <issue-number|""
   need jq
-  local open=$1 branch
+  local open=$1 issue=${2:-} branch
   branch=$(git branch --show-current 2>/dev/null) || branch=''
-  _forge_publish "$branch" "$open"
+  _forge_publish "$branch" "$open" "$issue"
 }
 
 # --- review ledger ----------------------------------------------------------
@@ -962,8 +962,37 @@ mechanism_open_issue() { # <title> <body-file>
       number: (if $number == "" then null else ($number | tonumber) end)}'
 }
 
-_forge_publish() { # <branch> <open>
-  local branch=$1 open=$2 remote host kind
+# Closes one tracked item, by the number the publishing verb recorded. Like the
+# opening counterpart it reports facts and never decides: whether an item should
+# be closed is the caller's question, and a tracker that refuses is a warning
+# there, never a failed integration here.
+mechanism_close_issue() { # <number>
+  need jq
+  local number=$1 remote host kind
+  [[ $number =~ ^[0-9]+$ ]] || { printf '%s\n' '{"error":"ISSUE_NUMBER_INVALID"}'; return 1; }
+  remote=$(git remote get-url origin 2>/dev/null) || {
+    printf '%s\n' '{"error":"REPOSITORY_UNKNOWN"}'; return 1; }
+  host=$(_forge_host "$remote")
+  kind=$(_forge_kind "$remote")
+  case $kind in
+    github)
+      GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0 \
+        gh issue close "$number" >/dev/null 2>&1 \
+        || { printf '%s\n' '{"error":"ISSUE_CLOSE_FAILED"}'; return 1; }
+      ;;
+    gitlab)
+      GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+        glab issue close "$number" >/dev/null 2>&1 \
+        || { printf '%s\n' '{"error":"ISSUE_CLOSE_FAILED"}'; return 1; }
+      ;;
+    *) printf '%s\n' '{"error":"ISSUE_MECHANISM_UNSUPPORTED"}'; return 1 ;;
+  esac
+  jq -nc --arg forge "$kind" --argjson number "$number" \
+    '{ok: true, forge: $forge, number: $number}'
+}
+
+_forge_publish() { # <branch> <open> <issue-number|""
+  local branch=$1 open=$2 issue=${3:-} remote host kind body=''
   remote=$(git remote get-url origin 2>/dev/null) || { printf '%s\n' '{"error":"PUBLISH_FAILED"}'; return 1; }
   host=$(_forge_host "$remote")
   kind=$(_forge_kind "$remote")
@@ -992,25 +1021,44 @@ _forge_publish() { # <branch> <open>
       '{error: "NO_COMMITS_TO_PUBLISH", branch: $branch, integration_base: $base}'
     return 1
   fi
+  # The link back to the tracked item is written HERE, in the body, because that
+  # is the only place the tracker reads a closing reference. No item, no link: an
+  # empty body stays empty instead of carrying a dangling keyword.
+  [[ -n $issue ]] && body="Closes #$issue"
   case $kind in
     github)
-      GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0 \
-        gh pr view "$branch" --json number >/dev/null 2>&1 \
-        || GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0 \
-             gh pr create --draft --base "$base" --head "$branch" \
-               --title "$branch" --body '' >/dev/null 2>&1 \
+      if GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0 \
+           gh pr view "$branch" --json number >/dev/null 2>&1; then
+        # Already proposed. The body is refreshed only when there is a link to
+        # add, and a failure here is not a failed publication: the change is
+        # open and re-stating its body is an improvement, not the act itself.
+        if [[ -n $body ]]; then
+          GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0 \
+            gh pr edit "$branch" --body "$body" >/dev/null 2>&1 || true
+        fi
+      else
+        GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0 \
+          gh pr create --draft --base "$base" --head "$branch" \
+            --title "$branch" --body "$body" >/dev/null 2>&1 \
         || { printf '%s\n' '{"error":"PUBLISH_FAILED"}'; return 1; }
+      fi
       if [[ $open == true ]]; then
         GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0 gh pr ready "$branch" >/dev/null 2>&1 \
           || { printf '%s\n' '{"error":"PUBLISH_FAILED"}'; return 1; }
       fi
       ;;
     gitlab)
-      GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
-        glab mr view "$branch" >/dev/null 2>&1 \
-        || GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
-             glab mr create --draft -b "$base" -s "$branch" -t "$branch" -d '' -y >/dev/null 2>&1 \
+      if GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+           glab mr view "$branch" >/dev/null 2>&1; then
+        if [[ -n $body ]]; then
+          GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+            glab mr update "$branch" -d "$body" >/dev/null 2>&1 || true
+        fi
+      else
+        GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+          glab mr create --draft -b "$base" -s "$branch" -t "$branch" -d "$body" -y >/dev/null 2>&1 \
         || { printf '%s\n' '{"error":"PUBLISH_FAILED"}'; return 1; }
+      fi
       if [[ $open == true ]]; then
         GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 glab mr update "$branch" --ready >/dev/null 2>&1 \
           || { printf '%s\n' '{"error":"PUBLISH_FAILED"}'; return 1; }

@@ -21,6 +21,45 @@ mech_get() { printf '%s' "$MECH_OUT" | jq -r "$1"; }
 # Error literal of the last captured mechanism failure.
 mech_error() { printf '%s' "$MECH_OUT" | jq -r '.error // "unknown"'; }
 
+# The line `open-issue` writes into the planning issue file. It is the run's
+# durable link to the tracked item: whoever publishes the change reads it here
+# instead of asking the tracker a second time, and it travels with the artifact
+# so a resumed run still finds it.
+issue_marker_line() { # <issue-file> → the marker line, or nothing
+  local file=$1 marker=''
+  [[ -f $file ]] || return 0
+  marker=$(grep -m1 -E '^Forge-Issue:' "$file" 2>/dev/null) || marker=''
+  [[ -n $marker ]] && printf '%s\n' "$marker"
+  return 0
+}
+
+# The tracked item a change closes: an explicit number, or the marker the
+# publishing verb wrote into the planning issue file. Shared by the verbs that
+# publish and integrate, so the two can never disagree about where the number
+# comes from, and so neither has to re-ask the tracker for a fact it already
+# wrote down.
+#
+# Returns the number on stdout. Status: 0 found-or-absent, 2 the file cannot be
+# read, 3 the number is malformed. It never fails the process: a caller that
+# gets a non-zero status owns the refusal, because only it knows which reason
+# literal belongs to its own surface.
+change_issue_number() { # <issue-number> <issue-file> → number
+  local issue=$1 issue_file=$2 marker=''
+  if [[ -n $issue_file && ! -f $issue_file ]]; then return 2; fi
+  if [[ -z $issue && -n $issue_file ]]; then
+    marker=$(issue_marker_line "$issue_file")
+    if [[ -n $marker ]]; then
+      issue=$(printf '%s\n' "$marker" | awk '{print $2}')
+      # A marker with the number missing is malformed, exactly like a number that
+      # is not one: silently unlinking would hide a broken artifact.
+      [[ -n $issue ]] || return 3
+    fi
+  fi
+  if [[ -n $issue && ! $issue =~ ^[0-9]+$ ]]; then return 3; fi
+  printf '%s\n' "$issue"
+  return 0
+}
+
 # The repository's verification policy: what proves this change is safe to
 # integrate when the hosted verification is ABSENT. Declared at the repository
 # root in `.change-verification` (first non-empty, non-# line): `local` says the

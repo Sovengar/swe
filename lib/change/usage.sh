@@ -14,7 +14,7 @@ Usage:
   swe open-issue --issue-file <path> [--plan-file <path>]
                                 [--title <title>] [--dry-run]
   swe publish-change          # shared: push the current branch
-  swe propose-change [--open] # worktree — open the pull request
+  swe propose-change [--open] [--issue <n>] [--issue-file <path>] # worktree — open the pull request
   swe record-review --tip <tip> --verdict <pass|fix>
                                 [--severity-json <json>] [--lenses-open <csv>]
                                 [--verification <state>]
@@ -22,7 +22,7 @@ Usage:
   swe ready-to-integrate
   swe shape-change-history plan
   swe shape-change-history apply --messages <file>
-  swe integrate-change
+  swe integrate-change [--issue <n>] [--issue-file <path>]
   swe clean-up-after-integration --change <change>
 
   This entrypoint owns the PIPELINE axis only. It never creates a working

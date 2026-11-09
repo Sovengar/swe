@@ -9,13 +9,39 @@
 
 swe_source_once core.sh change/common.sh
 
+# Closing the tracked item is the LAST and least essential step: the change is
+# integrated either way, so a tracker that refuses becomes a warning instead of a
+# failed integration the caller would retry for nothing. It is skipped when the
+# run never opened an item, and it is safe to repeat: closing twice is a no-op.
+_close_issue_if_any() { # <issue-number|"">
+  local issue=$1
+  [[ -n $issue ]] || return 0
+  mech_capture mechanism_close_issue "$issue"
+  [[ $MECH_RC -eq 0 ]] || warn+=("issue_not_closed")
+  return 0
+}
+
 cmd_integrate_change() {
+  local issue='' issue_file=''
   while [[ $# -gt 0 ]]; do
     case $1 in
+      --issue) [[ $# -ge 2 ]] || change_usage; issue=$2; shift 2 ;;
+      --issue-file)
+                 [[ $# -ge 2 ]] || change_usage; issue_file=$2; shift 2 ;;
       -h|--help) change_usage ;;
       *) fail "unknown_argument_$1" ;;
     esac
   done
+
+  # The tracked item this change closes, resolved exactly like publication
+  # resolves it: an explicit number, or the marker the opening verb wrote.
+  local raw_issue=$issue issue_rc=0
+  issue=$(change_issue_number "$issue" "$issue_file") || issue_rc=$?
+  case $issue_rc in
+    0) ;;
+    2) fail "issue_file_unreadable" "$(jq -nc --arg path "$issue_file" '{path: $path}')" ;;
+    *) fail "invalid_issue_number" "$(jq -nc --arg issue "$raw_issue" '{issue: $issue}')" ;;
+  esac
 
   change_resolve_destination
 
@@ -74,6 +100,9 @@ cmd_integrate_change() {
   change=$(mech_get '.change')
   state=$(mech_get '.state')
   if [[ $state == integrated ]]; then
+    # The item is closed even on this re-entry: a run that integrated and then
+    # died before closing must end consistent, and closing twice is a no-op.
+    _close_issue_if_any "$issue"
     jq -nc --arg repository "$DEST_REPOSITORY" --arg integration_base "$DEST_BASE" \
            --arg change "$change" --argjson warnings "$(warnings_json)" '
       {ok: true, integrated: true, noop: true, repository: $repository,
@@ -111,6 +140,7 @@ cmd_integrate_change() {
   # 4. Integrate pinned to the verified revision.
   mech_capture mechanism_integrate "$head"
   if [[ $MECH_RC -eq 0 ]]; then
+    _close_issue_if_any "$issue"
     jq -nc --arg repository "$DEST_REPOSITORY" --arg integration_base "$DEST_BASE" \
            --arg change "$change" --argjson warnings "$(warnings_json)" '
       {ok: true, integrated: true, noop: false, repository: $repository,

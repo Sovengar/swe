@@ -54,18 +54,33 @@ cmd_publish_change() {
 
 # Worktree publication: propose the change branch into the integration base.
 cmd_propose_change() {
-  local open=false
+  local open=false issue='' issue_file=''
   while [[ $# -gt 0 ]]; do
     case $1 in
       --open)    open=true; shift ;;
+      --issue)   [[ $# -ge 2 ]] || change_usage; issue=$2; shift 2 ;;
+      --issue-file)
+                 [[ $# -ge 2 ]] || change_usage; issue_file=$2; shift 2 ;;
       -h|--help) change_usage ;;
       *) fail "unknown_argument_$1" ;;
     esac
   done
 
+  # The tracked item this change closes. Two sources, one answer: an explicit
+  # number, or the marker the publishing verb wrote into the planning issue file.
+  # With neither, the change is proposed unlinked — never a failure, because a run
+  # may legitimately have no tracker item at all.
+  local raw_issue=$issue issue_rc=0
+  issue=$(change_issue_number "$issue" "$issue_file") || issue_rc=$?
+  case $issue_rc in
+    0) ;;
+    2) fail "issue_file_unreadable" "$(jq -nc --arg path "$issue_file" '{path: $path}')" ;;
+    *) fail "invalid_issue_number" "$(jq -nc --arg issue "$raw_issue" '{issue: $issue}')" ;;
+  esac
+
   change_resolve_destination
 
-  mech_capture mechanism_publish "$open"
+  mech_capture mechanism_publish "$open" "$issue"
   # The mechanism object carries the context that makes the refusal actionable
   # (which branch, which base, how many commits). Passing it as the extra object
   # keeps that context on the domain failure instead of leaving a bare reason.
