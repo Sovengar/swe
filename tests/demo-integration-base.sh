@@ -3,7 +3,7 @@
 # real repositories, not fixtures. Read-only: it creates one scratch repository
 # under TMPDIR and removes it on exit. Run from anywhere inside a checkout:
 #
-#   bash home/dot_local/lib/swe/tests/demo-integration-base.sh
+#   bash tests/demo-integration-base.sh
 #
 # It answers the question the bug was about: which base does swe compute for a
 # repository whose default branch is not `dev`?
