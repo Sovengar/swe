@@ -1,0 +1,23 @@
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local noise. The suites write under mktemp, so anything matching here is a
+# stray artifact of a manual run, never a fixture the repo needs.
+*.log
+*.tmp
+/tmp/
+/scratch/
+
+# Never commit a local override or a credentials file. An example may be
+# committed on purpose, so it is un-ignored explicitly.
+.env
+.env.*
+!.env.example
