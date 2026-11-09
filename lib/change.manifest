@@ -1,0 +1,21 @@
+# verb<TAB>module<TAB>function
+# Domain registry for the change/repository verbs, read by the entrypoint's
+# routing hook only AFTER the lifecycle manifest (verbs.manifest) failed to
+# match. Lifecycle names therefore win on any collision by construction.
+#
+# One row per top-level verb; the module path is relative to $SWE_LIB. Subcommand
+# dispatch (shape-change-history plan|apply) is resolved inside the owning module,
+# never as extra rows here.
+how-to-test	change/how-to-test.sh	cmd_how_to_test
+mutation-scope	change/mutation-scope.sh	cmd_mutation_scope
+await-verification	change/await-verification.sh	cmd_await_verification
+change-status	change/change-status.sh	cmd_change_status
+open-issue	change/open-issue.sh	cmd_open_issue
+publish-change	change/publish-change.sh	cmd_publish_change
+propose-change	change/publish-change.sh	cmd_propose_change
+record-review	change/review.sh	cmd_record_review
+review-round	change/review.sh	cmd_review_round
+ready-to-integrate	change/ready-to-integrate.sh	cmd_ready_to_integrate
+shape-change-history	change/shape-change-history.sh	cmd_shape_change_history
+integrate-change	change/integrate-change.sh	cmd_integrate_change
+clean-up-after-integration	change/clean-up-after-integration.sh	cmd_clean_up_after_integration

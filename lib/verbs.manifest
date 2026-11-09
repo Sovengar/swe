@@ -1,0 +1,9 @@
+# verb<TAB>module<TAB>function
+# Routes each public subcommand to the module that implements it. Keep this the
+# single source of truth for the verb set: the entrypoint reads it, so a verb
+# that is not listed here is rejected as unknown.
+ensure	workspace.sh	cmd_ensure
+location	session.sh	cmd_location
+resolve	session.sh	cmd_resolve
+remove	workspace.sh	cmd_remove
+close	view.sh	cmd_close
