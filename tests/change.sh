@@ -168,6 +168,21 @@ case " $* " in
     [[ ${GH_MERGE_LANDED:-0} == 1 ]] && touch "$(dirname "${BASH_SOURCE[0]}")/.merged"
     exit "${GH_MERGE_RC:-0}"
     ;;
+  *" issue create "*)
+    # Recorded so a test can prove a resume never reaches the forge a second
+    # time. ISSUE_OUTPUT models a forge that reports success WITHOUT a URL.
+    printf '%s\n' "$*" >> "$(dirname "${BASH_SOURCE[0]}")/.gh_issue_calls"
+    if [[ -n ${ISSUE_OUTPUT:-} ]]; then
+      printf '%s\n' "$ISSUE_OUTPUT"
+    else
+      printf 'https://github.com/example/repo/issues/42\n'
+    fi
+    exit 0
+    ;;
+  *" issue close "*)
+    printf '%s\n' "$*" >> "$(dirname "${BASH_SOURCE[0]}")/.gh_issue_closed"
+    exit 0
+    ;;
 esac
 view=${GH_VIEW_JSON:-}
 if [[ ${GH_MERGE_LANDED:-0} == 1 && -f "$(dirname "${BASH_SOURCE[0]}")/.merged" ]]; then
@@ -186,6 +201,17 @@ cat > "$STUBBIN/glab" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
+  *"issue create"*)
+    # The argv is recorded verbatim: the test asserts the body travels as a
+    # FILE and never as an argument.
+    printf '%s\n' "$*" >> "${GLAB_ARGV_FILE:-$(dirname "${BASH_SOURCE[0]}")/.glab_issue_argv}"
+    printf '%s\n' "${GLAB_ISSUE_URL:-https://gitlab.com/example/repo/-/issues/7}"
+    exit 0
+    ;;
+  *"issue close"*)
+    printf '%s\n' "$*" >> "${GLAB_CLOSE_FILE:-$(dirname "${BASH_SOURCE[0]}")/.glab_issue_closed}"
+    exit 0
+    ;;
   *"/approvals"*)
     if [[ ${GLAB_APPROVALS_RC:-0} != 0 ]]; then exit "${GLAB_APPROVALS_RC}"; fi
     printf '%s' "${GLAB_APPROVALS_JSON:-}" ;;
@@ -1725,6 +1751,105 @@ fake_clear
 fake_err issue ''
 run_fake open-issue --issue-file "$OI/fail.md"
 check "open-issue unreadable mechanism" "ISSUE_CREATE_FAILED" "$(jout '.reason')"
+
+# --- the real mechanism, against the forge --------------------------------
+# The block above proves the verb's contract against an injected mechanism. The
+# block below proves the concrete implementation actually produces those facts:
+# URL/number parsing, argv shapes, the payload on a resumed dry run, the UTF-8
+# title cap, and the self-hosted host override.
+unset GITLAB_HOST
+REAL_GH="$tmp/oi-real-gh"; mk_repo "$REAL_GH" "https://github.com/example/repo.git"
+GH_CALLS="$STUBBIN/.gh_issue_calls"
+GLAB_ARGV="$STUBBIN/.glab_issue_argv"
+gh_calls() { if [[ -f $GH_CALLS ]]; then grep -c . "$GH_CALLS"; else printf 0; fi; }
+
+# 1. The ordinary case: the URL identifies the item, and the marker makes the
+# second call a local answer instead of a second issue.
+rm -f "$GH_CALLS"
+printf '# Real GitHub issue\n\nBody of the real issue.\n' > "$tmp/real-gh.md"
+run_real_in "$REAL_GH" open-issue --issue-file "$tmp/real-gh.md"
+check "real gh ok" true "$(jout '.ok')"
+check "real gh number" 42 "$(jout '.issue.number')"
+check "real gh url" "https://github.com/example/repo/issues/42" "$(jout '.issue.url')"
+check "real gh marker once" 1 "$(grep -c '^Forge-Issue: 42 ' "$tmp/real-gh.md" || true)"
+check "real gh forge called once" 1 "$(gh_calls)"
+run_real_in "$REAL_GH" open-issue --issue-file "$tmp/real-gh.md"
+check "real gh resume existing" true "$(jout '.existing')"
+check "real gh resume no second call" 1 "$(gh_calls)"
+
+# 2. A URL-less success still publishes. `✓ Created issue #42` names the item;
+# reading only the URL would report a failure and the next resume would open a
+# duplicate.
+rm -f "$GH_CALLS"
+printf '# URL-less issue\n\nBody.\n' > "$tmp/real-nourl.md"
+export ISSUE_OUTPUT='✓ Created issue #42'
+run_real_in "$REAL_GH" open-issue --issue-file "$tmp/real-nourl.md"
+unset ISSUE_OUTPUT
+check "real gh no-url ok" true "$(jout '.ok')"
+check "real gh no-url number" 42 "$(jout '.issue.number')"
+check "real gh no-url url null" null "$(jout '.issue.url')"
+check "real gh no-url marker" "Forge-Issue: 42" \
+  "$(sed -n 's/[[:space:]]*$//; /^Forge-Issue:/p' "$tmp/real-nourl.md")"
+check "real gh no-url forge called once" 1 "$(gh_calls)"
+run_real_in "$REAL_GH" open-issue --issue-file "$tmp/real-nourl.md"
+check "real gh no-url resume existing" true "$(jout '.existing')"
+check "real gh no-url resume no second call" 1 "$(gh_calls)"
+
+# 3. GitLab carries the description as a file, never in argv.
+REAL_GL="$tmp/oi-real-glab"; mk_repo "$REAL_GL" "https://gitlab.com/example/repo.git"
+rm -f "$GLAB_ARGV"
+printf '# Real GitLab issue\n\nGLAB_BODY_SENTINEL\n' > "$tmp/real-glab.md"
+run_real_in "$REAL_GL" open-issue --issue-file "$tmp/real-glab.md"
+check "real glab ok" true "$(jout '.ok')"
+check "real glab number" 7 "$(jout '.issue.number')"
+check "real glab url" "https://gitlab.com/example/repo/-/issues/7" "$(jout '.issue.url')"
+check "real glab description as file" yes \
+  "$(grep -q -- '--description-file' "$GLAB_ARGV" && printf yes || printf no)"
+check "real glab body not in argv" no \
+  "$(grep -q 'GLAB_BODY_SENTINEL' "$GLAB_ARGV" && printf yes || printf no)"
+check "real glab marker once" 1 "$(grep -c '^Forge-Issue: 7 ' "$tmp/real-glab.md" || true)"
+
+# 4. A resumed --dry-run still owes the caller the payload; the marker replaces
+# the network call, not the answer.
+run_real_in "$REAL_GH" open-issue --issue-file "$tmp/real-gh.md" --dry-run
+check "real resume dry-run flag" true "$(jout '.dry_run')"
+check "real resume dry-run existing" true "$(jout '.existing')"
+check "real resume dry-run title" "Real GitHub issue" "$(jout '.title')"
+check "real resume dry-run body" true "$(jout '(.body | length) > 0')"
+check "real resume dry-run no call" 1 "$(gh_calls)"
+# A resumed dry run must not fail on a plan file that is gone.
+run_real_in "$REAL_GH" open-issue --issue-file "$tmp/real-gh.md" \
+  --plan-file "$tmp/absent-plan.md" --dry-run
+check "real resume dry-run missing plan ok" true "$(jout '.ok')"
+
+# 5. The 72-column cap counts CODEPOINTS, so an all-accented title is still
+# valid UTF-8 under the C locale. A byte slice cuts a character in half.
+printf '# A%s\n' "$(printf 'á%.0s' {1..80})" > "$tmp/real-accent.md"
+export LC_ALL=C
+run_real_in "$REAL_GH" open-issue --issue-file "$tmp/real-accent.md" --dry-run
+unset LC_ALL
+check "real accent title capped" 72 "$(jout '.title | length')"
+check "real accent title multibyte" true "$(jout '.title | utf8bytelength > 72')"
+check "real accent no replacement char" 0 \
+  "$(jout '[.title | explode[] | select(. == 65533)] | length')"
+check "real accent output is utf-8" valid \
+  "$(printf '%s' "$RUN_OUT" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 && printf valid || printf invalid)"
+
+# 6. A self-hosted instance lives on an address that does not say "gitlab".
+# GITLAB_HOST is the operator's word for it; without it the host is unknown.
+UNK="$tmp/oi-unknown"; mk_repo "$UNK" "git@git.company.com:o/r.git"
+rm -f "$GLAB_ARGV"
+printf '# Self-hosted issue\n\nBody.\n' > "$tmp/unknown-host.md"
+export GITLAB_HOST=gitlab.company.com
+run_real_in "$UNK" open-issue --issue-file "$tmp/unknown-host.md"
+unset GITLAB_HOST
+check "self-hosted glab ok" true "$(jout '.ok')"
+check "self-hosted glab number" 7 "$(jout '.issue.number')"
+check "self-hosted glab path taken" yes "$([[ -f $GLAB_ARGV ]] && printf yes || printf no)"
+printf '# Unsupported issue\n\nBody.\n' > "$tmp/unsupported-host.md"
+run_real_in "$UNK" open-issue --issue-file "$tmp/unsupported-host.md"
+check "unknown forge reason" "ISSUE_MECHANISM_UNSUPPORTED" "$(jout '.reason')"
+check "unknown forge exit" 1 "$RUN_RC"
 
 echo "=== J. vocabulary guard (new surface + agent prompts) ==="
 # Where the agent prompts live. RESOLVED, never assumed: this used to be a

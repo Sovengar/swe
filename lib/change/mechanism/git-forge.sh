@@ -451,7 +451,7 @@ _forge_pr_number() { # <branch>
         gh pr view "$1" --json number -q .number 2>/dev/null
       ;;
     gitlab)
-      GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+      GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
         glab api "projects/:id/merge_requests?source_branch=$1&state=opened" 2>/dev/null \
         | jq -r '.[0].iid // empty'
       ;;
@@ -472,7 +472,7 @@ _forge_pr_merged() { # <pr-number>
             gh pr view "$1" --json state -q .state 2>/dev/null) == MERGED ]]
       ;;
     gitlab)
-      [[ $(GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+      [[ $(GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
             glab api "projects/:id/merge_requests/$1" 2>/dev/null \
             | jq -r '.state // empty') == merged ]]
       ;;
@@ -706,7 +706,7 @@ _forge_ci_runs_gitlab() { # <branch>
   # Same source the change view reads the verdict from, so the two cannot
   # disagree: the MR's head pipeline, not a second pipeline query.
   local raw=''
-  raw=$(GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+  raw=$(GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
     glab api "projects/:id/merge_requests?source_branch=$branch" 2>/dev/null) || raw=''
   [[ -n $raw ]] || return 1
   jq -c --arg host "$host" --arg branch "$branch" '
@@ -826,7 +826,12 @@ _forge_kind() {
   case $host in
     *github*) printf 'github\n' ;;
     *gitlab*) printf 'gitlab\n' ;;
-    *) printf 'unknown\n' ;;
+    *)
+      # A host that names neither forge is still GitLab when the operator said
+      # so: GITLAB_HOST is glab's own override, and a self-hosted instance lives
+      # on an address that carries no "gitlab" in it.
+      if [[ -n ${GITLAB_HOST:-} ]]; then printf 'gitlab\n'; else printf 'unknown\n'; fi
+      ;;
   esac
 }
 
@@ -851,7 +856,7 @@ _forge_merge_state() { # <branch>
       ;;
     gitlab)
       local st=''
-      st=$(GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+      st=$(GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
            glab api "projects/:id/merge_requests?source_branch=$1" 2>/dev/null \
            | jq -r '.[0].merge_status // empty') || st=''
       case $st in
@@ -891,7 +896,7 @@ _forge_view() { # <branch>
       ;;
     gitlab)
       local mr iid approvals
-      mr=$(GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+      mr=$(GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
         glab api "projects/:id/merge_requests?source_branch=$1" 2>/dev/null) || return 1
       iid=$(printf '%s' "$mr" | jq -r '.[0].iid // empty' 2>/dev/null) || iid=''
       [[ -n $iid ]] || return 1
@@ -899,7 +904,7 @@ _forge_view() { # <branch>
       # endpoint is the real source. If it cannot be read, endorsements is
       # explicitly null rather than a silent 0.
       local raw=''
-      raw=$(GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+      raw=$(GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
         glab api "projects/:id/merge_requests/$iid/approvals" 2>/dev/null) || raw=''
       if [[ -n $raw ]]; then
         approvals=$(printf '%s' "$raw" | jq '[.approved_by[]?] | length' 2>/dev/null) || approvals=null
@@ -947,19 +952,33 @@ mechanism_open_issue() { # <title> <body-file>
         gh issue create --title "$title" --body-file "$body_file" 2>/dev/null) || out=''
       ;;
     gitlab)
-      out=$(GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
-        glab issue create --title "$title" --description "$(cat "$body_file" 2>/dev/null)" -y 2>/dev/null) || out=''
+      # The body travels as a file, never in argv: a description is the one
+      # argument that can outgrow the kernel's limit or collide with a flag.
+      out=$(GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
+        glab issue create --title "$title" --description-file "$body_file" -y 2>/dev/null) || out=''
       ;;
     *)
       printf '%s\n' '{"error":"ISSUE_MECHANISM_UNSUPPORTED"}'; return 1 ;;
   esac
+  # The address is the preferred fact, but not a required one: glab prints
+  # "✓ Created issue #7" and no URL at all. Deriving the number from the output
+  # instead of from the URL is what keeps a URL-less success from being reported
+  # as a failure and retried into a duplicate.
   url=$(printf '%s' "$out" | grep -Eo 'https?://[^[:space:]]+' | tail -n1) || url=''
-  [[ -n $url ]] || { printf '%s\n' '{"error":"ISSUE_CREATE_FAILED"}'; return 1; }
-  number=${url##*/}
-  [[ $number =~ ^[0-9]+$ ]] || number=''
+  number=''
+  if [[ -n $url ]]; then
+    number=${url##*/}
+    [[ $number =~ ^[0-9]+$ ]] || number=''
+  fi
+  if [[ -z $number ]]; then
+    number=$(printf '%s' "$out" | grep -Eo '#[0-9]+' | head -n1) || number=''
+    number=${number#\#}
+  fi
+  [[ -n $number ]] || { printf '%s\n' '{"error":"ISSUE_CREATE_FAILED"}'; return 1; }
   jq -nc --arg forge "$kind" --arg url "$url" --arg number "$number" \
-    '{ok: true, forge: $forge, url: $url,
-      number: (if $number == "" then null else ($number | tonumber) end)}'
+    '{ok: true, forge: $forge,
+      url: (if $url == "" then null else $url end),
+      number: ($number | tonumber)}'
 }
 
 # Closes one tracked item, by the number the publishing verb recorded. Like the
@@ -981,7 +1000,7 @@ mechanism_close_issue() { # <number>
         || { printf '%s\n' '{"error":"ISSUE_CLOSE_FAILED"}'; return 1; }
       ;;
     gitlab)
-      GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+      GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
         glab issue close "$number" >/dev/null 2>&1 \
         || { printf '%s\n' '{"error":"ISSUE_CLOSE_FAILED"}'; return 1; }
       ;;
@@ -1048,19 +1067,19 @@ _forge_publish() { # <branch> <open> <issue-number|""
       fi
       ;;
     gitlab)
-      if GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+      if GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
            glab mr view "$branch" >/dev/null 2>&1; then
         if [[ -n $body ]]; then
-          GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+          GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
             glab mr update "$branch" -d "$body" >/dev/null 2>&1 || true
         fi
       else
-        GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+        GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
           glab mr create --draft -b "$base" -s "$branch" -t "$branch" -d "$body" -y >/dev/null 2>&1 \
         || { printf '%s\n' '{"error":"PUBLISH_FAILED"}'; return 1; }
       fi
       if [[ $open == true ]]; then
-        GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 glab mr update "$branch" --ready >/dev/null 2>&1 \
+        GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 glab mr update "$branch" --ready >/dev/null 2>&1 \
           || { printf '%s\n' '{"error":"PUBLISH_FAILED"}'; return 1; }
       fi
       ;;
@@ -1087,7 +1106,7 @@ _forge_merge() { # <rev>
       GH_PROMPT_DISABLED=1 GIT_TERMINAL_PROMPT=0 \
         gh pr merge --rebase --match-head-commit "$1" --delete-branch "$branch" >/dev/null 2>&1 ;;
     gitlab)
-      GITLAB_HOST="$host" GIT_TERMINAL_PROMPT=0 \
+      GITLAB_HOST="${GITLAB_HOST:-$host}" GIT_TERMINAL_PROMPT=0 \
         glab mr merge "$branch" --yes --auto-merge=false --sha "$1" >/dev/null 2>&1 ;;
     *) return 1 ;;
   esac

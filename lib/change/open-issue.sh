@@ -22,6 +22,54 @@ swe_source_once core.sh change/common.sh
 # this verb. The planning agent only reads it.
 _ISSUE_MARKER='Forge-Issue:'
 
+# The publication payload: the title derived from the body (or the caller's
+# --title) and the body the tracker receives. One helper, two callers, so a
+# resumed --dry-run shows exactly what the first call would have sent.
+#
+# require_plan=false is the resume case: the item is already published, so a
+# plan file that has since gone away is not a failure, it is just absent.
+_issue_payload() { # <issue-file> <plan-file> <title> <require-plan>
+  local issue_file=$1 plan_file=$2 title=$3 require_plan=$4
+  local body=''
+  # The marker line describes the run, not the work, so it never enters the body.
+  body=$(grep -v -E "^${_ISSUE_MARKER}" "$issue_file" 2>/dev/null) || body=''
+
+  if [[ -z $title ]]; then
+    title=$(printf '%s\n' "$body" | grep -m1 -E '^#+[[:space:]]+' \
+            | sed -E 's/^#+[[:space:]]+//') || title=''
+    [[ -n $title ]] || title=$(printf '%s\n' "$body" | grep -m1 -E '[^[:space:]]') || title=''
+  fi
+  # One line, one spacing rule, at most 72 columns: a title that wraps is a
+  # title a human rewrites by hand.
+  title=$(printf '%s' "$title" | tr '\n\t' '  ' \
+    | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
+  # Capped by CODEPOINTS, through the jq this verb already requires. A byte slice
+  # under LC_ALL=C cuts a multibyte character in half and puts an invalid byte in
+  # the JSON; the shell slice stays only as the fallback when jq is unusable.
+  title=$(jq -rn --arg t "$title" '$t[0:72]') || title=${title:0:72}
+  [[ -n $title ]] || fail "ISSUE_TITLE_EMPTY"
+
+  if [[ -n $plan_file ]] && [[ -f $plan_file || $require_plan == true ]]; then
+    [[ -f $plan_file ]] || fail "ISSUE_PLAN_UNREADABLE" \
+      "$(jq -nc --arg path "$plan_file" '{path: $path}')"
+    body+=$'\n\n## Plan summary\n\n'
+    body+=$(cat "$plan_file")
+  fi
+
+  # The state directory is an absolute machine-specific path. It stays out of
+  # the published body: the tracker is read elsewhere, by people who do not have
+  # this filesystem.
+  local planning_dir=''
+  planning_dir=$(dirname "$(readlink -f "$issue_file" 2>/dev/null || printf '%s' "$issue_file")")
+  body=${body//"$planning_dir"/<planning_dir>}
+  if [[ -n $plan_file ]]; then
+    body=${body//"$(dirname "$(readlink -f "$plan_file" 2>/dev/null || printf '%s' "$plan_file")")"/<planning_dir>}
+  fi
+
+  _ISSUE_TITLE=$title
+  _ISSUE_BODY=$body
+}
+
 cmd_open_issue() {
   local issue_file='' plan_file='' title='' dry_run=false
   while [[ $# -gt 0 ]]; do
@@ -61,6 +109,19 @@ cmd_open_issue() {
     # that nobody can tell apart from the real one later.
     [[ $number =~ ^[0-9]+$ ]] || fail "ISSUE_MARKER_INVALID" \
       "$(jq -nc --arg path "$issue_file" '{path: $path}')"
+    if [[ $dry_run == true ]]; then
+      # A resumed dry run still owes the caller the payload; the marker only
+      # replaces the network call, never the answer.
+      _issue_payload "$issue_file" "$plan_file" "$title" false
+      jq -nc --arg title "$_ISSUE_TITLE" --arg body "$_ISSUE_BODY" \
+             --arg url "$url" --arg number "$number" '
+        {ok: true, existing: true, dry_run: true,
+         title: $title, body: $body,
+         issue: {number: ($number | tonumber),
+                 url: (if $url == "" then null else $url end)},
+         warnings: []}'
+      exit 0
+    fi
     jq -nc --arg number "$number" --arg url "$url" '
       {ok: true, existing: true, dry_run: false,
        issue: {number: ($number | tonumber),
@@ -70,38 +131,10 @@ cmd_open_issue() {
   fi
 
   # --- payload ------------------------------------------------------------
-  # The marker line describes the run, not the work, so it never enters the body.
   local body=''
-  body=$(grep -v -E "^${_ISSUE_MARKER}" "$issue_file" 2>/dev/null) || body=''
-
-  if [[ -z $title ]]; then
-    title=$(printf '%s\n' "$body" | grep -m1 -E '^#+[[:space:]]+' \
-            | sed -E 's/^#+[[:space:]]+//') || title=''
-    [[ -n $title ]] || title=$(printf '%s\n' "$body" | grep -m1 -E '[^[:space:]]') || title=''
-  fi
-  # One line, one spacing rule, at most 72 columns: a title that wraps is a
-  # title a human rewrites by hand.
-  title=$(printf '%s' "$title" | tr '\n\t' '  ' \
-    | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
-  title=${title:0:72}
-  [[ -n $title ]] || fail "ISSUE_TITLE_EMPTY"
-
-  if [[ -n $plan_file ]]; then
-    [[ -f $plan_file ]] || fail "ISSUE_PLAN_UNREADABLE" \
-      "$(jq -nc --arg path "$plan_file" '{path: $path}')"
-    body+=$'\n\n## Plan summary\n\n'
-    body+=$(cat "$plan_file")
-  fi
-
-  # The state directory is an absolute machine-specific path. It stays out of
-  # the published body: the tracker is read elsewhere, by people who do not have
-  # this filesystem.
-  local planning_dir=''
-  planning_dir=$(dirname "$(readlink -f "$issue_file" 2>/dev/null || printf '%s' "$issue_file")")
-  body=${body//"$planning_dir"/<planning_dir>}
-  if [[ -n $plan_file ]]; then
-    body=${body//"$(dirname "$(readlink -f "$plan_file" 2>/dev/null || printf '%s' "$plan_file")")"/<planning_dir>}
-  fi
+  _issue_payload "$issue_file" "$plan_file" "$title" true
+  title=$_ISSUE_TITLE
+  body=$_ISSUE_BODY
 
   if [[ $dry_run == true ]]; then
     jq -nc --arg title "$title" --arg body "$body" '
